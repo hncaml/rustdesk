@@ -37,6 +37,7 @@ use crate::{
 };
 use hbb_common::{
     anyhow::anyhow,
+    config,
     tokio::sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Mutex as TokioMutex,
@@ -406,12 +407,19 @@ fn run(vs: VideoService) -> ResultType<()> {
     let display_idx = vs.idx;
     let sp = vs.sp;
     let mut c = get_capturer(display_idx, last_portable_service_running)?;
-
+    #[cfg(windows)]
+    if !scrap::codec::enable_directx_capture() && !c.is_gdi() {
+        log::info!("disable dxgi with option, fall back to gdi");
+        c.set_gdi();
+    }
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     video_qos.refresh(None);
     let mut spf;
     let mut quality = video_qos.quality();
-    let record_incoming = !Config::get_option("allow-auto-record-incoming").is_empty();
+    let record_incoming = config::option2bool(
+        "allow-auto-record-incoming",
+        &Config::get_option("allow-auto-record-incoming"),
+    );
     let client_record = video_qos.record();
     drop(video_qos);
     let (mut encoder, encoder_cfg, codec_format, use_i444, recorder) = match setup_encoder(
@@ -477,6 +485,10 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut mid_data = Vec::new();
     let mut repeat_encode_counter = 0;
     let repeat_encode_max = 10;
+    let mut encode_fail_counter = 0;
+    let mut first_frame = true;
+    let capture_width = c.width;
+    let capture_height = c.height;
 
     while sp.ok() {
         #[cfg(windows)]
@@ -528,9 +540,10 @@ fn run(vs: VideoService) -> ResultType<()> {
         #[cfg(all(windows, feature = "vram"))]
         if c.is_gdi() && encoder.input_texture() {
             log::info!("changed to gdi when using vram");
+            VRamEncoder::set_fallback_gdi(display_idx, true);
             bail!("SWITCH");
         }
-        check_privacy_mode_changed(&sp, c.privacy_mode_id)?;
+        check_privacy_mode_changed(&sp, display_idx, &c)?;
         #[cfg(windows)]
         {
             if crate::platform::windows::desktop_changed()
@@ -563,11 +576,19 @@ fn run(vs: VideoService) -> ResultType<()> {
                         ms,
                         &mut encoder,
                         recorder.clone(),
+                        &mut encode_fail_counter,
+                        &mut first_frame,
+                        capture_width,
+                        capture_height,
                     )?;
                     frame_controller.set_send(now, send_conn_ids);
                 }
                 #[cfg(windows)]
                 {
+                    #[cfg(feature = "vram")]
+                    if try_gdi == 1 && !c.is_gdi() {
+                        VRamEncoder::set_fallback_gdi(display_idx, false);
+                    }
                     try_gdi = 0;
                 }
                 Ok(())
@@ -613,6 +634,10 @@ fn run(vs: VideoService) -> ResultType<()> {
                             ms,
                             &mut encoder,
                             recorder.clone(),
+                            &mut encode_fail_counter,
+                            &mut first_frame,
+                            capture_width,
+                            capture_height,
                         )?;
                         frame_controller.set_send(now, send_conn_ids);
                     }
@@ -643,7 +668,7 @@ fn run(vs: VideoService) -> ResultType<()> {
         let timeout_millis = 3_000u64;
         let wait_begin = Instant::now();
         while wait_begin.elapsed().as_millis() < timeout_millis as _ {
-            check_privacy_mode_changed(&sp, c.privacy_mode_id)?;
+            check_privacy_mode_changed(&sp, display_idx, &c)?;
             frame_controller.try_wait_next(&mut fetched_conn_ids, 300);
             // break if all connections have received current frame
             if fetched_conn_ids.len() >= frame_controller.send_conn_ids.len() {
@@ -703,7 +728,7 @@ fn setup_encoder(
     );
     Encoder::set_fallback(&encoder_cfg);
     let codec_format = Encoder::negotiated_codec();
-    let recorder = get_recorder(c.width, c.height, &codec_format, record_incoming);
+    let recorder = get_recorder(record_incoming, display_idx);
     let use_i444 = Encoder::use_i444(&encoder_cfg);
     let encoder = Encoder::new(encoder_cfg.clone(), use_i444)?;
     Ok((encoder, encoder_cfg, codec_format, use_i444, recorder))
@@ -785,12 +810,7 @@ fn get_encoder_config(
     }
 }
 
-fn get_recorder(
-    width: usize,
-    height: usize,
-    codec_format: &CodecFormat,
-    record_incoming: bool,
-) -> Arc<Mutex<Option<Recorder>>> {
+fn get_recorder(record_incoming: bool, display: usize) -> Arc<Mutex<Option<Recorder>>> {
     #[cfg(windows)]
     let root = crate::platform::is_root();
     #[cfg(not(windows))]
@@ -809,10 +829,7 @@ fn get_recorder(
             server: true,
             id: Config::get_id(),
             dir: crate::ui_interface::video_save_directory(root),
-            filename: "".to_owned(),
-            width,
-            height,
-            format: codec_format.clone(),
+            display,
             tx,
         })
         .map_or(Default::default(), |r| Arc::new(Mutex::new(Some(r))))
@@ -825,16 +842,33 @@ fn get_recorder(
 
 #[cfg(target_os = "android")]
 fn check_change_scale(hardware: bool) -> ResultType<()> {
+    use hbb_common::config::keys::OPTION_ENABLE_ANDROID_SOFTWARE_ENCODING_HALF_SCALE as SCALE_SOFT;
+
+    // isStart flag is set at the end of startCapture() in Android, wait it to be set.
+    for i in 0..6 {
+        if scrap::is_start() == Some(true) {
+            log::info!("start flag is set");
+            break;
+        }
+        log::info!("wait for start, {i}");
+        std::thread::sleep(Duration::from_millis(50));
+        if i == 5 {
+            log::error!("wait for start timeout");
+        }
+    }
     let screen_size = scrap::screen_size();
-    log::info!("hardware: {hardware}, screen_size: {screen_size:?}",);
+    let scale_soft = hbb_common::config::option2bool(SCALE_SOFT, &Config::get_option(SCALE_SOFT));
+    let half_scale = !hardware && scale_soft;
+    log::info!("hardware: {hardware}, scale_soft: {scale_soft}, screen_size: {screen_size:?}",);
     scrap::android::call_main_service_set_by_name(
-        "is_hardware_codec",
-        Some(hardware.to_string().as_str()),
+        "half_scale",
+        Some(half_scale.to_string().as_str()),
         None,
     )
     .ok();
     let old_scale = screen_size.2;
     let new_scale = scrap::screen_size().2;
+    log::info!("old_scale: {old_scale}, new_scale: {new_scale}");
     if old_scale != new_scale {
         log::info!("switch due to scale changed, {old_scale} -> {new_scale}");
         // switch is not a must, but it is better to do so.
@@ -843,9 +877,13 @@ fn check_change_scale(hardware: bool) -> ResultType<()> {
     Ok(())
 }
 
-fn check_privacy_mode_changed(sp: &GenericService, privacy_mode_id: i32) -> ResultType<()> {
+fn check_privacy_mode_changed(
+    sp: &GenericService,
+    display_idx: usize,
+    ci: &CapturerInfo,
+) -> ResultType<()> {
     let privacy_mode_id_2 = get_privacy_mode_conn_id().unwrap_or(INVALID_PRIVACY_MODE_CONN_ID);
-    if privacy_mode_id != privacy_mode_id_2 {
+    if ci.privacy_mode_id != privacy_mode_id_2 {
         if privacy_mode_id_2 != INVALID_PRIVACY_MODE_CONN_ID {
             let msg_out = crate::common::make_privacy_mode_msg(
                 back_notification::PrivacyModeState::PrvOnByOther,
@@ -854,6 +892,7 @@ fn check_privacy_mode_changed(sp: &GenericService, privacy_mode_id: i32) -> Resu
             sp.send_to_others(msg_out, privacy_mode_id_2);
         }
         log::info!("switch due to privacy mode changed");
+        try_broadcast_display_changed(&sp, display_idx, ci, true).ok();
         bail!("SWITCH");
     }
     Ok(())
@@ -867,6 +906,10 @@ fn handle_one_frame(
     ms: i64,
     encoder: &mut Encoder,
     recorder: Arc<Mutex<Option<Recorder>>>,
+    encode_fail_counter: &mut usize,
+    first_frame: &mut bool,
+    width: usize,
+    height: usize,
 ) -> ResultType<HashSet<i32>> {
     sp.snapshot(|sps| {
         // so that new sub and old sub share the same encoder after switch
@@ -878,8 +921,11 @@ fn handle_one_frame(
     })?;
 
     let mut send_conn_ids: HashSet<i32> = Default::default();
+    let first = *first_frame;
+    *first_frame = false;
     match encoder.encode_to_message(frame, ms) {
         Ok(mut vf) => {
+            *encode_fail_counter = 0;
             vf.display = display as _;
             let mut msg = Message::new();
             msg.set_video_frame(vf);
@@ -887,16 +933,39 @@ fn handle_one_frame(
                 .lock()
                 .unwrap()
                 .as_mut()
-                .map(|r| r.write_message(&msg));
+                .map(|r| r.write_message(&msg, width, height));
             send_conn_ids = sp.send_video_frame(msg);
         }
-        Err(e) => match e.to_string().as_str() {
-            scrap::codec::ENCODE_NEED_SWITCH => {
-                log::info!("switch due to encoder need switch");
-                bail!("SWITCH");
+        Err(e) => {
+            *encode_fail_counter += 1;
+            // Encoding errors are not frequent except on Android
+            if !cfg!(target_os = "android") {
+                log::error!("encode fail: {e:?}, times: {}", *encode_fail_counter,);
             }
-            _ => {}
-        },
+            let max_fail_times = if cfg!(target_os = "android") && encoder.is_hardware() {
+                9
+            } else {
+                3
+            };
+            let repeat = !encoder.latency_free();
+            // repeat encoders can reach max_fail_times on the first frame
+            if (first && !repeat) || *encode_fail_counter >= max_fail_times {
+                *encode_fail_counter = 0;
+                if encoder.is_hardware() {
+                    encoder.disable();
+                    log::error!("switch due to encoding fails, first frame: {first}, error: {e:?}");
+                    bail!("SWITCH");
+                }
+            }
+            match e.to_string().as_str() {
+                scrap::codec::ENCODE_NEED_SWITCH => {
+                    encoder.disable();
+                    log::error!("switch due to encoder need switch");
+                    bail!("SWITCH");
+                }
+                _ => {}
+            }
+        }
     }
     Ok(send_conn_ids)
 }
