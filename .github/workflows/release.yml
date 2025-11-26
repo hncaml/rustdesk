@@ -1,0 +1,128 @@
+name: Build & Release RustDesk
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # -------------------------
+  # Windows Build (x64)
+  # -------------------------
+  build-windows:
+    name: Windows x64 Build
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Enable Windows Desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Build Windows
+        run: |
+          flutter build windows --release
+          cargo build --release
+
+      - name: Package Windows
+        run: powershell Compress-Archive -Path target\release\rustdesk.exe -DestinationPath rustdesk-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-windows-x64
+          path: rustdesk-windows-x64.zip
+
+  # -------------------------
+  # macOS ARM Build
+  # -------------------------
+  build-macos-arm:
+    name: macOS ARM Build
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Enable macOS Desktop
+        run: flutter config --enable-macos-desktop
+
+      - name: Build macOS
+        run: |
+          flutter build macos --release
+          cargo build --release
+
+      - name: Package macOS
+        run: zip -r rustdesk-macos-arm.zip target/release/rustdesk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-macos-arm
+          path: rustdesk-macos-arm.zip
+
+  # -------------------------
+  # Android APK Build
+  # -------------------------
+  build-android:
+    name: Android APK Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build Android APK
+        run: |
+          flutter config --enable-android
+          flutter build apk --release
+
+      - name: Copy APK
+        run: cp build/app/outputs/flutter-apk/app-release.apk rustdesk-android-arm64.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-android-arm64
+          path: rustdesk-android-arm64.apk
+
+  # -------------------------
+  # Release Job
+  # -------------------------
+  create-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-macos-arm, build-android]
+
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/rustdesk-windows-x64.zip
+            dist/rustdesk-macos-arm.zip
+            dist/rustdesk-android-arm64.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
